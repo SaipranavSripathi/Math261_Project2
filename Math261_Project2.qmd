@@ -1,0 +1,677 @@
+---
+title: "Do College Characteristics Predict Alumni Earnings?"
+author: "Sai Pranav Sripathi"
+date: ""
+abstract: "This paper investigates to identify observable institutional characteristics that are associated with higher alumni earnings at U.S. colleges and universities over a 10 year period. I studied how median earnings in ten years after entry vary with instructional expenditures per full-time equivalent student, admissions selectivity, student financial aid composition, institution size, and the mix of academic programs. I fit multiple linear regression models with a log earnings outcome as well as a LASSO model for variable selection, and I evaluated prediction accuracy using a train/test split. I also constructed prediction intervals to assess how well the models quantify uncertainty in earnings predictions. Results indicate that higher instructional spending and greater selectivity are positively associated with alumni earnings, while a larger share of Pell Grant recipients is associated with lower median earnings, even after controlling for sector and state effects. I conclude by discussing limitations of this observational, cross-sectional approach, including timing mismatches between current institutional characteristics and earnings measured ten years after entry."
+research_question: "Which observable institutional characteristics are associated with higher alumni median earnings 10 years after entry, using the College Scorecard institutional dataset?"
+format: pdf
+number-sections: true
+bibliography: "references.bib"
+thanks: "Project repository available at: [https://github.com/SaipranavSripathi/Math261_Project2](https://github.com/SaipranavSripathi/Math261_Project2)."
+editor: visual
+---
+
+# Introduction
+
+The economic outcomes of college graduates are a major focus for students, families, and lawmakers. In particular, the median earnings of former students are often used as one measure of the “value” that a college or university provides, especially while calculating the ROI before joining any institution. However, institutions differ greatly in their resources, student populations, and academic programs, which may all influence earnings, and early work in economics found that measures of college quality have a substantial impact on lifetime earnings [@Solmon1975CollegeQuality] .The main question of this paper is: *How do instructional expenditures, selectivity, student composition, and program mix relate to an institution’s median alumni earnings ten years after entry?*
+
+This is an important issue because popular rankings systems increasingly emphasize earnings measures without always explaining what underlying factors drive them. Institutions themselves also make strategic decisions about how much to spend on instruction, which programs to emphasize, and what types of students to recruit. Understanding which observable characteristics are most strongly associated with alumni earnings can inform both institutional planning and how the public interprets this data.
+
+I used institutional-level data from the U.S. Department of Education’s College Scorecard for 2020–21 [@USDoE_Scorecard_2020_21], which provides detailed information on Title IV–participating colleges and universities in the United States, including student outcomes such as median earnings ten years after entry. Title IV participating institutions are those that are eligible to offer federal aid like grants and loans to students. Recent work has used College Scorecard data and machine learning methods to predict post-collegiate earnings and debt [@AgrawalGanesanWyngarden2015] . Using this dataset, I fit regression models where the outcome is the log of median earnings ten years after entry, and the predictors include log instructional expenditures per full-time equivalent (FTE) student, admission rates as measures of selectivity, the share of undergraduates receiving Pell Grants, the log of undergraduate enrollment, and the distribution of completions across broad program areas.
+
+The analysis in this paper is descriptive and predictive rather than causal. I aim to quantify the associations between institutional characteristics and alumni earnings, compare the predictive performance of a standard multiple regression and a LASSO model, and evaluate the width of prediction intervals for new institutions. The remainder of this paper has the following structure, Section 2 describes the dataset and main variables, Section 3 explains the methods and statistical tests, Section 4 presents the results, and Section 5 discusses the broader implications and limitations.
+
+```{r}
+#| label: setup
+#| include: false
+#| warning: false
+#| message: false
+#| echo: false
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(glmnet)
+library(sandwich)
+library(lmtest)
+library(knitr)
+library(tibble)
+```
+
+```{r}
+#| label: data-load
+#| warning: false
+#| message: false
+#| echo: false
+
+pcip_vars <- c("PCIP14", "PCIP11", "PCIP52", "PCIP26")
+
+scorecard_raw <- read_csv("./data/MERGED2020_21_PP.csv")
+
+scorecard <- scorecard_raw |>
+select(
+UNITID, INSTNM, STABBR, CONTROL, UGDS,
+MD_EARN_WNE_P10, INEXPFTE, ADM_RATE, PCTPELL,
+all_of(pcip_vars)
+)
+
+college <- scorecard |>
+mutate(
+log_earn     = log(MD_EARN_WNE_P10),
+log_inexpfte = log(INEXPFTE),
+log_ugds     = log(UGDS),
+CONTROL = factor(
+CONTROL,
+levels = c(1, 2, 3),
+labels = c("Public", "Private_nonprofit", "Private_forprofit")
+),
+STABBR = factor(STABBR)
+) |>
+filter(
+!is.na(log_earn),
+!is.na(log_inexpfte),
+!is.na(ADM_RATE),
+!is.na(PCTPELL),
+!is.na(log_ugds)
+)
+
+```
+
+# Data and Variables
+
+This analysis uses the 2020–21 College Scorecard institutional file (`MERGED2020_21_PP.csv`), published by the U.S. Department of Education [@USDoE_Scorecard_2020_21]. Each record in this file corresponds to a single Title IV–participating post-secondary institution in the United States, including public universities, community colleges, private nonprofit colleges, and for-profit institutions. The unit of observation in all analysis is the institution.
+
+The primary response variable is **median earnings ten years after entry**, reported in the Scorecard as `MD_EARN_WNE_P10`. This variable records, for each institution, the median annual earnings of former students ten years after they first enrolled, conditional on being employed and not enrolled in further education. Since, the earnings are right-skewed as seen in @fig-earnings-hist , I worked with the log of median earnings in the regression models. Let $Y_i = log(MD\_EARN\_WINE\_P10_i)$ denote the log median earnings for institution i.
+
+```{r}
+#| label: fig-earnings-hist
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Distribution of median earnings (raw and log scale) ten years after entry
+
+n <- nrow(college)
+
+earn_long <- data.frame(
+  value = c(college$MD_EARN_WNE_P10, college$log_earn),
+  scale = rep(c("Earnings in Raw scale (USD)", "Earnings in Log scale"), each = n)
+)
+
+ggplot(earn_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ scale, scales = "free_x") +
+  labs(
+    x = NULL,
+    y = "Number of institutions"
+  ) +
+  theme_minimal()
+
+```
+
+Several institutional characteristics in the Scorecard data are plausibly related to alumni earnings, and their measures are summarized in @fig-boxplots-key-vars . Instructional expenditures per FTE (INEXPFTE) is measured by calculating total instructional spending divided by the number of full-time equivalent students and capture how much an institution invests in instruction per student. The box-plot for $\log(\text{INEXPFTE})$ shows substantial variation, with most institutions clustered around a moderate spending level but a handful of high-spending outliers. I modeled the log of instructional expenditures so that changes can be interpreted approximately in percentage terms and so that these very high-spending institutions do not dominate the analysis.
+
+PCIP refers to the Percentage of degrees awarded in a given program, where PCIP14 refers to share of completions in Engineering, PCIP11 for Computer Science, PCIP52 for Business, PCIP26 for Biological Sciences. Selectivity is summarized by the admission rate (ADM_RATE), the proportion of applicants who are admitted, and, when available, the average SAT score of enrolled students (SAT_AVG). The boxplot for ADM_RATE indicates that many institutions admit a large majority of applicants, but there is also a set of highly selective institutions with very low admission rates. The composition of students is described by the share of undergraduates receiving Pell Grants (PCTPELL) and by institution size. PCTPELL is the percentage of students who receive a Pell Grant, a need-based federal grant that provides financial aid to low-income undergraduate students. Its box-plot shows wide dispersion, with some institutions serving relatively few Pell recipients and others serving very high shares. Institution size is measured by total undergraduate enrollment (UGDS), and the box-plot for $\log(\text{UGDS})$ reveals a long upper tail of very large institutions, which motivates working with the logarithm rather than raw enrollment.
+
+```{r}
+#| label: fig-boxplots-key-vars
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Boxplots of key continuous variables
+
+library(tidyr)
+
+box_vars_long <- college |>
+  select(
+    log_earn,
+    log_inexpfte,
+    ADM_RATE,
+    PCTPELL,
+    log_ugds
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("log_earn", "log_inexpfte", "ADM_RATE", "PCTPELL", "log_ugds"),
+      labels = c(
+        "log earnings",
+        "log(INEXPFTE)",
+        "Admission rate",
+        "Pell share",
+        "log(UGDS)"
+      )
+    )
+  )
+
+ggplot(box_vars_long, aes(x = "", y = value)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Value"
+  ) +
+  theme_minimal()
+
+```
+
+Finally, for sector and state using the variables CONTROL and STABBR. CONTROL indicates whether an institution is public, private nonprofit, or private for-profit, and STABBR is the two-letter state abbreviation. In the regression models, both are included as sets of indicator variables (fixed effects), allowing for average differences across sectors and states that are not explained by the other predictors.
+
+To form a reliable sample, I avoided institutions that have missing values for the outcome variable `MD_EARN_WNE_P10`, for instructional expenditures per FTE, and for the core predictors (`ADM_RATE`, `PCTPELL`, `UGDS`, and the selected PCIP shares). After applying these conditions, the number of institutions drops from 6681 in the raw file to about 1794 used for the regression analysis. This means that institutions with incomplete reporting are excluded from the analysis and the conclusions apply most directly to institutions with relatively complete data and may not generalize to all U.S. colleges and universities.
+
+```{r}
+#| label: data-coverage
+#| warning: false
+#| message: false
+#| echo: false
+
+n_total    <- nrow(scorecard)
+n_analytic <- nrow(college)
+
+coverage_table <- tibble(
+Sample = c(
+"Number of Institutions",
+"Analytic sample (complete cases)"
+),
+n = c(n_total, n_analytic)
+)
+
+kable(
+coverage_table,
+caption = "Number of institutions in raw Scorecard file and in analytic sample."
+)
+```
+
+A fundamental limitation of the dataset is the **time lag** between institutional characteristics and the earnings outcome. The variable `MD_EARN_WNE_P10` reflects the earnings of students ten years after they first entered the institution, while the finance and admissions variables in the 2020–21 file describe a more recent snapshot of the institution. For example, if a university has substantially increased its instructional expenditures in the last few years, those changes may not yet be visible in the earnings of cohorts who entered a decade ago. Throughout the paper, I therefore interpret the estimated relationships as *contemporary associations with errors* between current institutional characteristics and alumni earnings rather than as causal effects.
+
+# Methods
+
+All data cleaning, visualization, and modeling were conducted in R [@RCoreTeam2023]. I used the \texttt{glmnet} package [@Friedman2010GLMNET] to fit the LASSO models and multiple standard R packages for data manipulation and graphics (like the \texttt{tidyverse} and related packages).
+
+To study how institutional characteristics are related to alumni earnings, I fit multiple linear regression models [@gelman_regression_2021] and a LASSO model [@Tibshirani1996Lasso].
+
+```{r}
+#| label: models-fit
+#| warning: false
+#| message: false
+#| echo: false
+
+set.seed(261)
+n <- nrow(college)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+train <- college[train_idx, ]
+test  <- college[-train_idx, ]
+
+# Original formula (for model.matrix)
+ols_formula <- log_earn ~ log_inexpfte + ADM_RATE + PCTPELL + log_ugds +
+  PCIP14 + PCIP11 + PCIP52 + PCIP26 +
+  CONTROL + STABBR
+
+# One common design matrix for ALL data (avoids factor-level issues)
+mm <- model.matrix(ols_formula, data = college)
+
+# Split design matrix into train / test using same columns
+x_train <- mm[train_idx, , drop = FALSE]
+x_test  <- mm[-train_idx, , drop = FALSE]
+
+y_train <- train$log_earn
+y_test  <- test$log_earn
+
+# ---------- OLS FIT (using design matrix) ----------
+x_train_df <- as.data.frame(x_train)
+x_train_df$log_earn <- y_train
+
+# -1 because "(Intercept)" is already a column in x_train
+ols_fit <- lm(log_earn ~ . - 1, data = x_train_df)
+
+# ---------- LASSO (no intercept column) ----------
+x_train_noint <- x_train[, colnames(x_train) != "(Intercept)", drop = FALSE]
+
+set.seed(261)
+cv_lasso <- cv.glmnet(
+  x_train_noint, y_train,
+  alpha  = 1,
+  nfolds = 10
+)
+
+lambda_1se <- cv_lasso$lambda.1se
+
+coef_1se <- coef(cv_lasso, s = lambda_1se)
+selected_vars <- rownames(coef_1se)[coef_1se[, 1] != 0]
+selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+
+x_train_sel_df <- as.data.frame(x_train_noint)
+x_train_sel_df$log_earn <- y_train
+
+lasso_formula <- as.formula(
+  paste("log_earn ~", paste(selected_vars, collapse = " + "))
+)
+
+lasso_fit <- lm(lasso_formula, data = x_train_sel_df)
+
+# Save test matrices as data frames for later use
+x_test_df       <- as.data.frame(x_test)
+x_test_noint    <- x_test[, colnames(x_test) != "(Intercept)", drop = FALSE]
+x_test_noint_df <- as.data.frame(x_test_noint)
+```
+
+## Multiple linear regression model
+
+Let $Y_i$​ denote the log median earnings for institution i. The main regression model is:\
+
+$Y_i = \beta_0+\beta_1 log(INEXPFTE_i)+\beta_2(ADMRATE_i) + \beta_3(PCTPELL_i) + \beta_4 (log(UGDS_i)) + Y^T(PCIP_i) + \delta sector(i) + \delta state(i) + \epsilon_i$
+
+where $PCIP_i$​ is the vector of selected program-mix shares for institution i. The PCIP variables record the shares of an institution’s completions in broad fields of study (for example, engineering, computer science, business, and biological sciences), so they summarize the mix of majors offered at each college. Including these program-mix shares allows the model to capture the fact that institutions emphasizing higher-paying fields may have higher median earnings even if their spending, selectivity, and student composition are similar. $\delta sector(i)$ and $\delta state(i)$ are sector and state fixed effects, and $\epsilon_i$​ is an error term capturing unexplained variation in log earnings. The coefficients are estimated using ordinary least squares (OLS). Under this model, a coefficient on a continuous predictor represents the approximate percentage change in median earnings associated with a one-unit change in that predictor, holding other variables fixed.
+
+One parameter of particular interest is $\beta_1$​, the coefficient on log instructional expenditures per FTE. This coefficient measures the elasticity of median earnings with respect to instructional spending. I have performed the one-sided hypothesis test: $H_0 : \beta_1 <= 0 \ \  vs. \ \ H_1 : \beta_1 > 0$\
+which asks whether higher instructional spending is associated with higher alumni earnings. The test statistic is the usual t-statistic for $\beta_1$​ from the OLS regression. I report the estimated coefficient, its standard error, the corresponding t-value, and p-value. I have also constructed a 95% confidence interval for $\beta_1$. In addition, I examine the estimated coefficients for the program-mix variables to assess whether they appear to be important predictors of earnings.
+
+Standard linear regression assumptions are used: the errors $\epsilon_i$ are assumed to be independent with mean zero and constant variance, and approximately normally distributed. I assess these assumptions using residual diagnostics (residuals versus fitted values, Q–Q plots) and also compute heteroskedasticity-robust standard errors to reduce sensitivity to unequal variances across institutions.
+
+```{r}
+#| label: fig-correlations
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Correlations between log median earnings and key continuous predictors
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+corr_df <- college |>
+  summarise(
+    log_inexpfte = cor(log_earn, log_inexpfte, use = "complete.obs"),
+    ADM_RATE     = cor(log_earn, ADM_RATE,     use = "complete.obs"),
+    PCTPELL      = cor(log_earn, PCTPELL,      use = "complete.obs"),
+    log_ugds     = cor(log_earn, log_ugds,     use = "complete.obs"),
+    PCIP14       = cor(log_earn, PCIP14,       use = "complete.obs"),
+    PCIP11       = cor(log_earn, PCIP11,       use = "complete.obs"),
+    PCIP52       = cor(log_earn, PCIP52,       use = "complete.obs"),
+    PCIP26       = cor(log_earn, PCIP26,       use = "complete.obs")
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "correlation"
+  ) |>
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("log_inexpfte","ADM_RATE","PCTPELL","log_ugds",
+                 "PCIP14","PCIP11","PCIP52","PCIP26"),
+      labels = c(
+        "log(INEXPFTE)",
+        "Admission rate",
+        "Pell share",
+        "log(UGDS)",
+        "PCIP14 (Engineering)",
+        "PCIP11 (CS)",
+        "PCIP52 (Business)",
+        "PCIP26 (Bio sci)"
+      )
+    )
+  )
+
+ggplot(corr_df, aes(x = variable, y = correlation)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Correlation with log earnings"
+  ) +
+  theme_minimal()
+```
+
+## LASSO model for variable selection
+
+The design matrix includes several correlated predictors and many indicator variables for states and sectors, I also fit a LASSO regression model [@Tibshirani1996Lasso] . The LASSO estimates coefficients by minimizing the usual sum of squared residuals plus an $l_1$ penalty on the size of the coefficients. This penalty shrinks many coefficients toward zero and can set some of them exactly to zero, effectively selecting a smaller set of predictors.
+
+I constructed a model matrix that includes all variables from the OLS model, standardized where appropriate, and fit the LASSO using K-fold cross-validation to choose the penalty parameter $\lambda$. I focus on the “one standard error” rule to obtain a more simple model which can explain the data comparably well. After identifying the set of predictors with non-zero coefficients at this value of $\lambda$, I refit an OLS model using only those variables to obtain interpretable coefficient estimates and standard errors. To evaluate predictive performance and construct prediction intervals, I split the analytic sample into a training set (80%) and a test set (20%), stratified by the outcome variable. All models are estimated using the training data only. I then used the fitted models to predict log median earnings for institutions in the test set.
+
+For each model, I computed **root mean squared error (RMSE)**, **mean absolute error (MAE)**, and $R^2$ on the test sample. For the OLS model, I also compute 95% prediction intervals for the test institutions. Prediction intervals account for both the uncertainty in the estimated regression line and the residual variability around that line. I then exponentiate the interval endpoints to obtain prediction intervals on the dollar scale for median earnings from the log scale. Comparing these intervals across institutions and examining their width helps in assessing how precisely the model can predict earnings for new colleges.
+
+# Results
+
+Descriptive plots relating log median earnings against each main predictor suggest positive associations with log instructional expenditures and selectivity, and a negative association with the Pell share and admission rate. Plots involving program-mix shares and the regression results shows that institutions with a greater emphasis on high paying fields such as Engineering, Computer Science, Business, Biological Science etc. tend to have higher earnings than other institutions, consistent with known differences in labor-market returns by major in general.
+
+## Multiple regression estimates
+
+Table 2 reports the OLS estimates for the full model with log median earnings as the outcome. The coefficient on log instructional expenditures per FTE, $\beta_1$ is positive and statistically significant at the 5% level. Interpreting this coefficient, a 10% increase in instructional spending per FTE is associated with an approximate 0.10 x 0.113 = 0.0113 log units = 1.1% increase in median alumni earnings, holding other variables constant. This provides evidence against the null hypothesis that higher instructional spending has no association with alumni earnings, in favor of the one-sided alternative that higher earnings. A 95% confidence interval for $\beta_1$ is approximately $(0.084, 0.142)$, implying that a 10% increase in instructional spending per FTE is associated with between about $0.8\%$ and $1.4\%$ higher median earnings.
+
+```{r}
+#| label: results-ols-coefs
+#| warning: false
+#| message: false
+#| echo: false
+
+cov_robust <- sandwich::vcovHC(ols_fit, type = "HC1")
+ols_robust <- lmtest::coeftest(ols_fit, vcov. = cov_robust)
+ols_robust_tidy <- broom::tidy(ols_robust)
+
+ols_main <- ols_robust_tidy |>
+  filter(term %in% c(
+    "log_inexpfte", "ADM_RATE", "PCTPELL", "log_ugds",
+    "PCIP14", "PCIP11", "PCIP52", "PCIP26"
+  )) |>
+  mutate(
+    estimate  = round(estimate, 3),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 2),
+    p.value   = signif(p.value, 3)
+  )
+
+kable(
+  ols_main,
+  caption = "OLS regression of log median earnings on institutional characteristics.",
+  booktabs = TRUE
+)
+```
+
+The estimates for selectivity variables also show strong relationships: institutions with lower admission rates or higher average SAT scores tend to have higher alumni earnings. The coefficient on `PCTPELL` is negative, indicating that institutions enrolling a larger share of Pell recipients generally report lower median earnings, even after controlling for spending, size, and program mix. For example, an increase of 10 percentage points in the Pell share is associated with about a 0.10 x (-0.415) = -0.0415 = 4.2% decrease in median earnings. Several program-mix (PCIP) variables are significant as well. Higher shares of completions in Engineering, Computer Science, Business, Biological Science etc. are associated with higher median earnings. Sector and state indicators capture remaining systematic differences across institution types and geographic locations, but the main patterns described above remain even after including these controls.
+
+The diagnostic plots for the OLS model indicate that the residuals are nearly centered around zero in the residuals vs fitted plot across the entire range of fitted values and doesn't display strong curvature. This is a strong indication of linearity assumption being reasonably satisfied. But, since the spread of residuals is not constant, and has points with large residuals, it could mean a possible heteroskedasticity and potential outliers. The Q-Q plot compares the standardized residuals to a normal distribution, and clearly indicates that it follows the reference line fairly in the middle, but has large positive and negative residuals. This indicates heavier tails instead of a normal distribution of errors.\
+These are some of the observations based on the errors, but the overall conclusions about which predictors are important or how each predictor impacts the median earnings remains the same.
+
+```{r}
+#| label: fig-ols-diagnostics
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Regression diagnostics for the OLS model, residuals vs fitted and normal Q–Q plot.
+
+par(mfrow = c(1, 2))
+plot(ols_fit, which = 1)
+plot(ols_fit, which = 2)
+par(mfrow = c(1, 1))
+```
+
+## LASSO selection and predictive performance
+
+The LASSO regression selects a subset of predictors that includes log instructional expenditures, admission rate, Pell share, log enrollment, and several key PCIP variables, along with some of the sector and state indicators. Many weaker predictors are shrunk exactly to zero. When I refit OLS using only the selected predictors, the resulting model achieves predictive performance on the test set that is similar to the full OLS model: the coefficient on log instructional spending is about 0.13, coefficient on admission rate is about -0.12, and the coefficient on Pell share is about -0.44. Interpreted in the same way, these estimates imply that a 10% increase in instructional spending would roughly increase the median alumni earnings by 1.3%, similarly for Pell share it would indicate a 4.4% drop in median earnings, if we hold other predictors in each case constant.
+
+```{r}
+#| label: results-performance
+#| warning: false
+#| message: false
+#| echo: false
+
+# OLS predictions using design-matrix test data
+ols_pred   <- predict(ols_fit,   newdata = x_test_df)
+
+# LASSO-selected OLS predictions using no-intercept test matrix
+lasso_pred <- predict(lasso_fit, newdata = x_test_noint_df)
+
+rmse <- function(truth, pred) sqrt(mean((truth - pred)^2))
+mae  <- function(truth, pred) mean(abs(truth - pred))
+r2   <- function(truth, pred) 1 - sum((truth - pred)^2) / sum((truth - mean(truth))^2)
+
+perf_table <- tibble(
+  Model = c("OLS (full)", "OLS (LASSO-selected)"),
+  RMSE  = c(rmse(y_test, ols_pred),
+            rmse(y_test, lasso_pred)),
+  MAE   = c(mae(y_test, ols_pred),
+            mae(y_test, lasso_pred)),
+  R2    = c(r2(y_test, ols_pred),
+            r2(y_test, lasso_pred))
+) |>
+  mutate(
+    RMSE = round(RMSE, 3),
+    MAE  = round(MAE, 3),
+    R2   = round(R2, 3)
+  )
+
+kable(
+  perf_table,
+  caption = "Test-set predictive performance for OLS and LASSO-based models.",
+  booktabs = TRUE
+)
+```
+
+To assess whether this simpler model loses predictive accuracy, I have compared the full OLS model with the LASSO-selected model. The full OLS model achieves an RMSE of 0.188, an MAE of 0.127 and an $R^2$ of 0.585. The OLS model based on LASSO-selected predictors has a slightly higher RMSE of 0.195, and MAE of 0.137 with $R^2$ of 0.549. This indicates that the LASSO-selected model explains slightly less of the variation in log median earnings but does so with fewer predictors.
+
+Several program-mix (PCIP) variables are significant as well. Higher shares of completions in Engineering, Computer Science, Business, Biological Science etc. are associated with higher median earnings. Sector and state indicators capture remaining systematic differences across institution types and geographic locations, but the main patterns described above remain even after including these controls.
+
+```{r}
+#| label: fig-coef-plot1
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Estimated effects of key predictors on log median earnings
+
+coef_plot_data <- ols_robust_tidy |>
+  dplyr::filter(term %in% c(
+    "log_inexpfte", "ADM_RATE", "PCTPELL", "log_ugds",
+    "PCIP14", "PCIP11", "PCIP52", "PCIP26"
+  )) |>
+  dplyr::mutate(
+    term_pretty = dplyr::case_when(
+      term == "log_inexpfte" ~ "log(INEXPFTE)",
+      term == "ADM_RATE"     ~ "Admission rate",
+      term == "PCTPELL"      ~ "Pell share",
+      term == "log_ugds"     ~ "log(UGDS)",
+      term == "PCIP14"       ~ "PCIP14 (Engineering share)",
+      term == "PCIP11"       ~ "PCIP11 (CS share)",
+      term == "PCIP52"       ~ "PCIP52 (Business share)",
+      term == "PCIP26"       ~ "PCIP26 (Bio sci share)",
+      TRUE                   ~ term
+    ),
+    term_pretty = factor(term_pretty, levels = rev(unique(term_pretty)))
+  )
+
+ggplot(coef_plot_data,
+       aes(x = estimate, y = term_pretty)) +
+  geom_point() +
+  geom_errorbarh(
+    aes(xmin = estimate - 1.96 * std.error,
+        xmax = estimate + 1.96 * std.error),
+    height = 0.2
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Estimated effect on log(median earnings)",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-pred-vs-obs
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: Predicted vs observed median earnings on test set
+
+# Use dollars, not logs
+pred_comp <- tibble(
+  observed = exp(y_test),
+  ols_pred = exp(ols_pred),
+  lasso_pred = exp(lasso_pred)
+)
+
+ggplot(pred_comp, aes(x = observed, y = ols_pred)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    x = "Observed median earnings (USD)",
+    y = "Predicted median earnings (USD)",
+    title = "OLS predictions vs observed earnings (test set)"
+  ) +
+  theme_minimal()
+```
+
+The scatter plots of predicted vs observed log earnings for these two models look very similar, with predictions clustering around 45-degree line and has relatively high errors for those institutions with higher earnings. Overall, LASSO confirms set of predictors that are most important for forecasting earnings and shows that spending, selectivity, Pell share, program mix in high-return fields and sector and state effects have most of the predictive power in the OLS model.
+
+```{r}
+#| label: fig-pred-vs-obs-lasso
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-cap: LASSO-selected model predictions vs observed median earnings on test set
+
+ggplot(pred_comp, aes(x = observed, y = lasso_pred)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    x = "Observed median earnings (USD)",
+    y = "Predicted median earnings (USD)",
+    title = "LASSO-selected model predictions vs observed earnings (test set)"
+  ) +
+  theme_minimal()
+```
+
+## Prediction intervals
+
+For institutions in the test set, I have computed 95% prediction intervals for log earnings from the OLS model and transform them back to the dollar scale. These intervals are often fairly wide. For a representative public four-year institution with typical values of the predictors, the model predicts median earnings of about \$58811, with a 95% prediction interval from roughly \$40392 to \$85627. This means that two institutions with very similar observed characteristics can still have substantially different alumni earnings, emphasizing the uncertainty involved in using such models for precise prediction.
+
+Overall, the results show that the predictors considered especially instructional spending, selectivity, Pell share, and program mix are clearly associated with alumni earnings, but they do not fully determine them. Table 4 illustrates this by reporting observed earnings, point predictions, and prediction intervals for a subset of institutions: in many cases the intervals span several tens of thousands of dollars, even when the model’s point prediction is close to the observed value.
+
+```{r}
+#| label: results-prediction-intervals
+#| warning: false
+#| message: false
+#| echo: false
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(knitr)
+
+# 95% prediction intervals on log scale using OLS + design matrix
+pred_pi <- predict(
+  ols_fit,
+  newdata = x_test_df,
+  interval = "prediction",
+  level = 0.95
+)
+
+pred_df <- cbind(
+  test,
+  fit_log = pred_pi[, "fit"],
+  lwr_log = pred_pi[, "lwr"],
+  upr_log = pred_pi[, "upr"]
+) |>
+  mutate(
+    fit_dollars = exp(fit_log),
+    lwr_dollars = exp(lwr_log),
+    upr_dollars = exp(upr_log)
+  )
+
+# Top 5 institutions by observed earnings
+pred_example <- pred_df |>
+  arrange(desc(MD_EARN_WNE_P10)) |>
+  slice_head(n = 5) |>
+  select(
+    Institution   = INSTNM,
+    State         = STABBR,
+    Sector        = CONTROL,
+    observed_earn = MD_EARN_WNE_P10,
+    fit_dollars, lwr_dollars, upr_dollars
+  ) |>
+  mutate(
+    across(
+      c(observed_earn, fit_dollars, lwr_dollars, upr_dollars),
+      ~ round(.x, 0)
+    ),
+    # wrap long names and simplify sector labels
+    Institution = str_wrap(Institution, width = 28),
+    Sector = recode(
+      Sector,
+      "Private_nonprofit" = "Private non-profit",
+      "Private_forprofit" = "Private for-profit"
+    )
+  ) |>
+  rename(
+    `Observed (USD)`  = observed_earn,
+    `Predicted (USD)` = fit_dollars,
+    `Lower 95%`       = lwr_dollars,
+    `Upper 95%`       = upr_dollars
+  )
+
+kable(
+  pred_example,
+  caption = "Observed and predicted median earnings (with 95% prediction intervals) for the top five institutions in the test set by observed earnings.",
+  booktabs = TRUE,
+  row.names = FALSE,
+  align = c("l", "c", "c", "r", "r", "r", "r")
+)
+
+```
+
+Table 5 shows the corresponding results for San Jose State University, a large public institution. For SJSU, the observed median earnings are about \$78988, while the model predicts roughly \$69002 with a 95% prediction interval from about \$47716 to \$99783. Again, the observed outcome lies well inside the interval, but the range is close to \$50000 wide.
+
+```{r}
+#| label: sjsu-prediction
+#| warning: false
+#| message: false
+#| echo: false
+
+# 1. Find San Jose State University in the full college data
+sjsu_raw <- college |>
+  dplyr::filter(INSTNM == "San Jose State University")
+
+if (nrow(sjsu_raw) == 0) {
+  stop("San Jose State University not found in 'college' dataset. Check the INSTNM spelling.")
+}
+
+# 2. Build the design-matrix row using the same formula as the main model
+sjsu_mm <- model.matrix(ols_formula, data = sjsu_raw)
+
+# 3. Prediction + 95% prediction interval on log scale, then back to dollars
+sjsu_pi <- predict(
+  ols_fit,
+  newdata = as.data.frame(sjsu_mm),
+  interval = "prediction",
+  level = 0.95
+)
+
+# 4. Assemble a clean one-row table with nice column headings
+sjsu_example <- sjsu_raw |>
+  dplyr::mutate(
+    fit_dollars = exp(sjsu_pi[, "fit"]),
+    lwr_dollars = exp(sjsu_pi[, "lwr"]),
+    upr_dollars = exp(sjsu_pi[, "upr"])
+  ) |>
+  dplyr::select(
+    INSTNM, STABBR, CONTROL,
+    observed_earn = MD_EARN_WNE_P10,
+    fit_dollars, lwr_dollars, upr_dollars
+  ) |>
+  dplyr::mutate(
+    dplyr::across(
+      c(observed_earn, fit_dollars, lwr_dollars, upr_dollars),
+      ~ round(.x, 0)
+    )
+  ) |>
+  dplyr::rename(
+    Institution       = INSTNM,
+    State             = STABBR,
+    Sector            = CONTROL,
+    `Observed (USD)`  = observed_earn,
+    `Predicted (USD)` = fit_dollars,
+    `Lower 95%`       = lwr_dollars,
+    `Upper 95%`       = upr_dollars
+  )
+
+knitr::kable(
+  sjsu_example,
+  caption = "Observed and predicted median earnings for San Jose State University (with 95% prediction interval).",
+  booktabs = TRUE
+)
+
+```
+
+# Discussion
+
+This study used multiple linear regression and LASSO regression to examine how institutional characteristics relate to median alumni earnings ten years after entry, using data from the 2020–21 College Scorecard. The main findings are that higher instructional expenditures per FTE, greater admissions selectivity, and a program mix emphasizing high-earning fields are associated with higher alumni earnings, while a higher share of Pell Grant recipients is associated with lower earnings. A LASSO model confirms the importance of these variables and yields similar predictive performance to the full regression model. However, prediction intervals are quite wide, indicating that even with detailed institutional data, there is substantial uncertainty in predicting earnings for any given college.
+
+Several limitations qualify these conclusions. First, the analysis is purely observational and cross-sectional. Important factors such as students’ prior academic preparation, family background, and local labor market conditions are not directly observed, and these could significantly impact the estimated relationships. Second, the timing mismatch between current institutional characteristics and earnings measured ten years after entry indicates that recent changes in spending, selectivity, or program mix may not yet be reflected in the outcome; institutions that have recently increased instructional expenditures, for example, may still appear similar to lower-spending institutions in this dataset. Third, missing data reduced the analytic sample and this may have introduced selection bias if institutions with incomplete reporting differ systematically from those with full data. Finally, all analyses are at the institution level, so they do not capture within-institution variation across student subgroups.
+
+Even with these limitations, the results contribute to our understanding of how institutional resources and student and program composition are related to alumni earnings at the college level. They suggest that policies or strategies focused on instructional investment and on offering programs with strong labor-market returns may be associated with higher earnings, although causal claims cannot be made without stronger designs. Future work could build on this project by using panel data across multiple years of the Scorecard to align inputs and outcomes more carefully over time, by exploring nonlinear models or interaction effects, and inclusion of regional labor markets when available.
+
+# References
